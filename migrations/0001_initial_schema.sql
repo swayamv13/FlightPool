@@ -162,6 +162,87 @@ CREATE TABLE group_members (
 CREATE UNIQUE INDEX uq_group_members_one_active_group_per_booking ON group_members (booking_id) WHERE status = 'ACTIVE';
 CREATE INDEX idx_group_members_group_active ON group_members (group_id) WHERE status = 'ACTIVE';
 
+CREATE OR REPLACE FUNCTION protect_frozen_group_membership()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    PERFORM 1
+    FROM ride_groups AS group_row
+    WHERE group_row.id = OLD.group_id
+    FOR UPDATE;
+
+    IF EXISTS (
+      SELECT 1
+      FROM ride_groups
+      WHERE id = OLD.group_id
+        AND membership_frozen_at IS NOT NULL
+    ) THEN
+      RAISE EXCEPTION 'cannot delete membership from frozen group %', OLD.group_id;
+    END IF;
+
+    RETURN OLD;
+  END IF;
+
+  IF TG_OP = 'INSERT' THEN
+    PERFORM 1
+    FROM ride_groups AS group_row
+    WHERE group_row.id = NEW.group_id
+    FOR UPDATE;
+
+    IF EXISTS (
+      SELECT 1
+      FROM ride_groups
+      WHERE id = NEW.group_id
+        AND membership_frozen_at IS NOT NULL
+    ) THEN
+      RAISE EXCEPTION 'cannot insert membership into frozen group %', NEW.group_id;
+    END IF;
+
+    RETURN NEW;
+  END IF;
+
+  IF OLD.group_id IS DISTINCT FROM NEW.group_id THEN
+    PERFORM 1
+    FROM ride_groups AS group_row
+    WHERE group_row.id IN (OLD.group_id, NEW.group_id)
+    ORDER BY group_row.id
+    FOR UPDATE;
+
+    IF EXISTS (
+      SELECT 1
+      FROM ride_groups
+      WHERE id IN (OLD.group_id, NEW.group_id)
+        AND membership_frozen_at IS NOT NULL
+    ) THEN
+      RAISE EXCEPTION 'cannot move membership from or into frozen groups';
+    END IF;
+  ELSE
+    PERFORM 1
+    FROM ride_groups AS group_row
+    WHERE group_row.id = NEW.group_id
+    FOR UPDATE;
+
+    IF EXISTS (
+      SELECT 1
+      FROM ride_groups
+      WHERE id = NEW.group_id
+        AND membership_frozen_at IS NOT NULL
+    ) THEN
+      RAISE EXCEPTION 'cannot update membership in frozen group %', NEW.group_id;
+    END IF;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER protect_frozen_group_membership
+BEFORE INSERT OR UPDATE OR DELETE ON group_members
+FOR EACH ROW
+EXECUTE FUNCTION protect_frozen_group_membership();
+
 CREATE TABLE group_proposals (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   group_id UUID NOT NULL REFERENCES ride_groups(id) ON DELETE RESTRICT,
@@ -176,6 +257,7 @@ CREATE TABLE group_proposals (
   expires_at TIMESTAMPTZ NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (group_id, proposal_version),
+  CONSTRAINT uq_group_proposals_id_group UNIQUE (id, group_id),
   CHECK (proposal_version > 0),
   CHECK (route_distance_meters >= 0),
   CHECK (estimated_duration_seconds >= 0)
@@ -184,8 +266,9 @@ CREATE INDEX idx_group_proposals_group_created ON group_proposals (group_id, cre
 
 CREATE TABLE fare_quotes (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  proposal_id UUID NOT NULL REFERENCES group_proposals(id) ON DELETE RESTRICT,
-  booking_id UUID NOT NULL REFERENCES bookings(id) ON DELETE RESTRICT,
+  proposal_id UUID NOT NULL,
+  booking_id UUID NOT NULL,
+  group_id UUID NOT NULL,
   quote_version INTEGER NOT NULL,
   currency CHAR(3) NOT NULL DEFAULT 'INR',
   base_amount_paise BIGINT NOT NULL DEFAULT 0,
@@ -198,6 +281,16 @@ CREATE TABLE fare_quotes (
   expires_at TIMESTAMPTZ NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (proposal_id, booking_id, quote_version),
+  CONSTRAINT uq_fare_quotes_id_booking UNIQUE (id, booking_id),
+  CONSTRAINT uq_fare_quotes_id_booking_group UNIQUE (id, booking_id, group_id),
+  CONSTRAINT fk_fare_quotes_proposal_group
+    FOREIGN KEY (proposal_id, group_id)
+    REFERENCES group_proposals(id, group_id)
+    ON DELETE RESTRICT,
+  CONSTRAINT fk_fare_quotes_group_booking
+    FOREIGN KEY (group_id, booking_id)
+    REFERENCES group_members(group_id, booking_id)
+    ON DELETE RESTRICT,
   CHECK (quote_version > 0),
   CHECK (base_amount_paise >= 0 AND distance_amount_paise >= 0),
   CHECK (toll_amount_paise >= 0 AND airport_fee_paise >= 0),
@@ -205,15 +298,34 @@ CREATE TABLE fare_quotes (
 );
 CREATE INDEX idx_fare_quotes_booking_created ON fare_quotes (booking_id, created_at DESC);
 
+CREATE OR REPLACE FUNCTION prevent_fare_quote_changes()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RAISE EXCEPTION
+    'fare quotes are immutable; insert a new quote_version instead';
+END;
+$$;
+
+CREATE TRIGGER trg_fare_quotes_immutable
+BEFORE UPDATE OR DELETE ON fare_quotes
+FOR EACH ROW
+EXECUTE FUNCTION prevent_fare_quote_changes();
+
 CREATE TABLE fare_consents (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  fare_quote_id UUID NOT NULL REFERENCES fare_quotes(id) ON DELETE RESTRICT,
-  booking_id UUID NOT NULL REFERENCES bookings(id) ON DELETE RESTRICT,
+  fare_quote_id UUID NOT NULL,
+  booking_id UUID NOT NULL,
   decision consent_decision NOT NULL DEFAULT 'PENDING',
   responded_at TIMESTAMPTZ,
   response_channel VARCHAR(30),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (fare_quote_id, booking_id),
+  CONSTRAINT fk_fare_consents_quote_booking
+    FOREIGN KEY (fare_quote_id, booking_id)
+    REFERENCES fare_quotes(id, booking_id)
+    ON DELETE RESTRICT,
   CHECK ((decision = 'PENDING' AND responded_at IS NULL) OR (decision <> 'PENDING' AND responded_at IS NOT NULL))
 );
 CREATE INDEX idx_fare_consents_quote_decision ON fare_consents (fare_quote_id, decision);
@@ -239,6 +351,7 @@ CREATE TABLE vehicles (
   verification_status driver_verification_status NOT NULL DEFAULT 'PENDING',
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT uq_vehicles_driver_id_id UNIQUE (driver_id, id),
   CHECK (passenger_capacity BETWEEN 1 AND 8),
   CHECK (luggage_capacity_units >= 0)
 );
@@ -276,14 +389,16 @@ CREATE TABLE rides (
   cancelled_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT uq_rides_id_group UNIQUE (id, group_id),
   CHECK (otp_attempt_count >= 0)
 );
 CREATE INDEX idx_rides_status_created ON rides (status, created_at);
 
 CREATE TABLE ride_stops (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  ride_id UUID NOT NULL REFERENCES rides(id) ON DELETE RESTRICT,
-  booking_id UUID NOT NULL REFERENCES bookings(id) ON DELETE RESTRICT,
+  ride_id UUID NOT NULL,
+  booking_id UUID NOT NULL,
+  group_id UUID NOT NULL,
   stop_order SMALLINT NOT NULL,
   stop_type stop_type NOT NULL,
   locality VARCHAR(100) NOT NULL,
@@ -295,6 +410,14 @@ CREATE TABLE ride_stops (
   actual_arrival_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (ride_id, stop_order),
+  CONSTRAINT fk_ride_stops_ride_group
+    FOREIGN KEY (ride_id, group_id)
+    REFERENCES rides(id, group_id)
+    ON DELETE RESTRICT,
+  CONSTRAINT fk_ride_stops_group_booking
+    FOREIGN KEY (group_id, booking_id)
+    REFERENCES group_members(group_id, booking_id)
+    ON DELETE RESTRICT,
   CHECK (stop_order > 0),
   CHECK (latitude BETWEEN -90 AND 90),
   CHECK (longitude BETWEEN -180 AND 180),
@@ -305,14 +428,18 @@ CREATE INDEX idx_ride_stops_booking ON ride_stops (booking_id, ride_id);
 CREATE TABLE driver_assignments (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   ride_id UUID NOT NULL REFERENCES rides(id) ON DELETE RESTRICT,
-  driver_id UUID NOT NULL REFERENCES drivers(id) ON DELETE RESTRICT,
-  vehicle_id UUID NOT NULL REFERENCES vehicles(id) ON DELETE RESTRICT,
+  driver_id UUID NOT NULL,
+  vehicle_id UUID NOT NULL,
   status assignment_status NOT NULL DEFAULT 'OFFERED',
   offered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   response_deadline TIMESTAMPTZ NOT NULL,
   responded_at TIMESTAMPTZ,
   rejection_reason_code VARCHAR(80),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT fk_driver_assignments_driver_vehicle
+    FOREIGN KEY (driver_id, vehicle_id)
+    REFERENCES vehicles(driver_id, id)
+    ON DELETE RESTRICT,
   CHECK (response_deadline > offered_at)
 );
 CREATE UNIQUE INDEX uq_driver_one_active_assignment ON driver_assignments (driver_id) WHERE status IN ('OFFERED','ACCEPTED');
@@ -321,9 +448,10 @@ CREATE INDEX idx_assignments_ride_created ON driver_assignments (ride_id, create
 
 CREATE TABLE payments (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  booking_id UUID NOT NULL REFERENCES bookings(id) ON DELETE RESTRICT,
-  ride_id UUID NOT NULL REFERENCES rides(id) ON DELETE RESTRICT,
-  fare_quote_id UUID NOT NULL REFERENCES fare_quotes(id) ON DELETE RESTRICT,
+  booking_id UUID NOT NULL,
+  ride_id UUID NOT NULL,
+  fare_quote_id UUID NOT NULL,
+  group_id UUID NOT NULL,
   amount_paise BIGINT NOT NULL,
   currency CHAR(3) NOT NULL DEFAULT 'INR',
   status payment_status NOT NULL DEFAULT 'PENDING',
@@ -333,10 +461,62 @@ CREATE TABLE payments (
   paid_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CHECK (amount_paise >= 0)
+  CONSTRAINT fk_payments_ride_group
+    FOREIGN KEY (ride_id, group_id)
+    REFERENCES rides(id, group_id)
+    ON DELETE RESTRICT,
+  CONSTRAINT fk_payments_group_booking
+    FOREIGN KEY (group_id, booking_id)
+    REFERENCES group_members(group_id, booking_id)
+    ON DELETE RESTRICT,
+  CONSTRAINT fk_payments_quote_booking_group
+    FOREIGN KEY (fare_quote_id, booking_id, group_id)
+    REFERENCES fare_quotes(id, booking_id, group_id)
+    ON DELETE RESTRICT,
+  CHECK (amount_paise >= 0),
+  CHECK (
+    (status = 'PAID' AND paid_at IS NOT NULL)
+    OR (status <> 'PAID' AND paid_at IS NULL)
+  )
 );
 CREATE INDEX idx_payments_booking_status ON payments (booking_id, status);
 CREATE INDEX idx_payments_ride ON payments (ride_id);
+
+CREATE OR REPLACE FUNCTION validate_payment_fare_quote()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  quote_amount BIGINT;
+  quote_currency CHAR(3);
+BEGIN
+  SELECT quote.total_amount_paise, quote.currency
+  INTO quote_amount, quote_currency
+  FROM fare_quotes AS quote
+  WHERE quote.id = NEW.fare_quote_id
+  FOR SHARE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'fare quote % does not exist', NEW.fare_quote_id;
+  END IF;
+
+  IF NEW.amount_paise <> quote_amount THEN
+    RAISE EXCEPTION 'payment amount does not match fare quote';
+  END IF;
+
+  IF NEW.currency IS DISTINCT FROM quote_currency THEN
+    RAISE EXCEPTION 'payment currency differs from fare quote currency';
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_payments_validate_fare_quote
+BEFORE INSERT OR UPDATE OF fare_quote_id, amount_paise, currency
+ON payments
+FOR EACH ROW
+EXECUTE FUNCTION validate_payment_fare_quote();
 
 CREATE TABLE payment_attempts (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -368,6 +548,98 @@ CREATE TABLE refunds (
   CHECK (amount_paise > 0)
 );
 CREATE INDEX idx_refunds_payment_status ON refunds (payment_id, status);
+
+CREATE OR REPLACE FUNCTION validate_payment_refund()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  payment_amount BIGINT;
+  payment_currency CHAR(3);
+  reserved_refunded BIGINT;
+BEGIN
+  IF TG_OP = 'UPDATE'
+     AND OLD.payment_id IS DISTINCT FROM NEW.payment_id THEN
+    PERFORM 1
+    FROM payments AS payment_row
+    WHERE payment_row.id IN (OLD.payment_id, NEW.payment_id)
+    ORDER BY payment_row.id
+    FOR UPDATE;
+  ELSE
+    PERFORM 1
+    FROM payments AS payment_row
+    WHERE payment_row.id = NEW.payment_id
+    FOR UPDATE;
+  END IF;
+
+  SELECT payment_row.amount_paise, payment_row.currency
+  INTO payment_amount, payment_currency
+  FROM payments AS payment_row
+  WHERE payment_row.id = NEW.payment_id;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'payment % does not exist', NEW.payment_id;
+  END IF;
+
+  IF NEW.currency IS DISTINCT FROM payment_currency THEN
+    RAISE EXCEPTION 'refund currency differs from payment currency';
+  END IF;
+
+  SELECT COALESCE(SUM(refund_row.amount_paise), 0)
+  INTO reserved_refunded
+  FROM refunds AS refund_row
+  WHERE refund_row.payment_id = NEW.payment_id
+    AND refund_row.status IN ('PENDING', 'PROCESSING', 'SUCCEEDED');
+
+  IF TG_OP = 'UPDATE'
+     AND OLD.payment_id = NEW.payment_id
+     AND OLD.status IN ('PENDING', 'PROCESSING', 'SUCCEEDED') THEN
+    reserved_refunded := reserved_refunded - OLD.amount_paise;
+  END IF;
+
+ IF NEW.status IN ('PENDING', 'PROCESSING', 'SUCCEEDED')
+   AND reserved_refunded + NEW.amount_paise > payment_amount THEN
+  RAISE EXCEPTION 'refund exceeds payment amount';
+END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_refunds_validate_payment
+BEFORE INSERT OR UPDATE OF amount_paise, payment_id, currency, status
+ON refunds
+FOR EACH ROW
+EXECUTE FUNCTION validate_payment_refund();
+
+CREATE OR REPLACE FUNCTION enforce_refund_status_transition()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF OLD.status = NEW.status THEN
+    RETURN NEW;
+  END IF;
+
+  IF (OLD.status, NEW.status) NOT IN (
+    ('PENDING', 'PROCESSING'),
+    ('PENDING', 'SUCCEEDED'),
+    ('PENDING', 'FAILED'),
+    ('PROCESSING', 'SUCCEEDED'),
+    ('PROCESSING', 'FAILED')
+  ) THEN
+    RAISE EXCEPTION 'invalid refund status transition: % -> %',
+      OLD.status, NEW.status;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_refunds_status_transition
+BEFORE UPDATE OF status ON refunds
+FOR EACH ROW
+EXECUTE FUNCTION enforce_refund_status_transition();
 
 CREATE TABLE driver_ledger_entries (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -413,6 +685,20 @@ CREATE TABLE audit_logs (
 CREATE INDEX idx_audit_entity_created ON audit_logs (entity_type, entity_id, created_at DESC);
 CREATE INDEX idx_audit_actor_created ON audit_logs (actor_user_id, created_at DESC);
 
+CREATE OR REPLACE FUNCTION prevent_audit_log_changes()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RAISE EXCEPTION 'audit logs are append-only';
+END;
+$$;
+
+CREATE TRIGGER trg_audit_logs_append_only
+BEFORE UPDATE OR DELETE ON audit_logs
+FOR EACH ROW
+EXECUTE FUNCTION prevent_audit_log_changes();
+
 CREATE TABLE outbox_events (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   aggregate_type VARCHAR(80) NOT NULL,
@@ -431,5 +717,73 @@ CREATE TABLE outbox_events (
 );
 CREATE INDEX idx_outbox_ready ON outbox_events (available_at, created_at) WHERE status IN ('PENDING','FAILED');
 CREATE INDEX idx_outbox_lease ON outbox_events (locked_until) WHERE status = 'PROCESSING';
+
+ALTER TABLE outbox_events
+  ADD CONSTRAINT ck_outbox_lock_pair
+  CHECK (
+    (locked_by IS NULL AND locked_until IS NULL)
+    OR (locked_by IS NOT NULL AND locked_until IS NOT NULL)
+  );
+
+ALTER TABLE outbox_events
+  ADD CONSTRAINT ck_outbox_pending_state
+  CHECK (
+    status <> 'PENDING'
+    OR (
+      locked_by IS NULL
+      AND locked_until IS NULL
+      AND delivered_at IS NULL
+    )
+  );
+
+ALTER TABLE outbox_events
+  ADD CONSTRAINT ck_outbox_processing_state
+  CHECK (
+    status <> 'PROCESSING'
+    OR (
+      attempt_count > 0
+      AND locked_by IS NOT NULL
+      AND locked_until IS NOT NULL
+      AND delivered_at IS NULL
+    )
+  );
+
+ALTER TABLE outbox_events
+  ADD CONSTRAINT ck_outbox_failed_state
+  CHECK (
+    status <> 'FAILED'
+    OR (
+      attempt_count > 0
+      AND locked_by IS NULL
+      AND locked_until IS NULL
+      AND delivered_at IS NULL
+      AND last_error_safe IS NOT NULL
+    )
+  );
+
+ALTER TABLE outbox_events
+  ADD CONSTRAINT ck_outbox_delivered_state
+  CHECK (
+    status <> 'DELIVERED'
+    OR (
+      attempt_count > 0
+      AND locked_by IS NULL
+      AND locked_until IS NULL
+      AND delivered_at IS NOT NULL
+    )
+  );
+
+ALTER TABLE outbox_events
+  ADD CONSTRAINT ck_outbox_dead_letter_state
+  CHECK (
+    status <> 'DEAD_LETTER'
+    OR (
+      attempt_count > 0
+      AND locked_by IS NULL
+      AND locked_until IS NULL
+      AND delivered_at IS NULL
+      AND last_error_safe IS NOT NULL
+    )
+  );
 
 -- updated_at is maintained by Rust service methods in v1; no implicit trigger.

@@ -1,5 +1,7 @@
-use axum::{Json, Router, http::StatusCode, routing::get};
+use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 use serde::Serialize;
+
+use super::AppState;
 
 #[derive(Debug, Serialize)]
 struct HealthResponse {
@@ -15,7 +17,7 @@ struct ReadyResponse {
     database: &'static str,
 }
 
-pub fn live_routes() -> Router {
+pub fn live_routes() -> Router<AppState> {
     Router::new().route(
         "/health/live",
         get(|| async {
@@ -27,12 +29,21 @@ pub fn live_routes() -> Router {
     )
 }
 
-pub fn ready_routes() -> Router {
-    Router::new().route("/health/ready", get(|| async { readiness(false) }))
+pub fn ready_routes() -> Router<AppState> {
+    Router::new().route("/health/ready", get(readiness))
 }
 
-fn readiness(database_configured: bool) -> (StatusCode, Json<ReadyResponse>) {
-    let (status_code, status) = if database_configured {
+async fn readiness(State(state): State<AppState>) -> (StatusCode, Json<ReadyResponse>) {
+    let database_available = sqlx::query_scalar::<_, i32>("SELECT 1")
+        .fetch_one(&state.pool)
+        .await
+        .is_ok_and(|value| value == 1);
+
+    readiness_response(database_available)
+}
+
+fn readiness_response(database_available: bool) -> (StatusCode, Json<ReadyResponse>) {
+    let (status_code, status) = if database_available {
         (StatusCode::OK, "ok")
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "unavailable")
@@ -43,11 +54,11 @@ fn readiness(database_configured: bool) -> (StatusCode, Json<ReadyResponse>) {
         Json(ReadyResponse {
             status,
             application_initialized: true,
-            database_configured,
-            database: if database_configured {
-                "configured"
+            database_configured: true,
+            database: if database_available {
+                "available"
             } else {
-                "not configured"
+                "unavailable"
             },
         }),
     )
@@ -77,7 +88,7 @@ mod tests {
 
     #[tokio::test]
     async fn liveness_returns_http_200() {
-        let router = Router::new().route(
+        let router = Router::<()>::new().route(
             "/health/live",
             get(|| async {
                 axum::Json(super::HealthResponse {
@@ -94,12 +105,11 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_returns_http_503_when_database_is_unavailable() {
-        let router =
-            Router::new().route("/health/ready", get(|| async { super::readiness(false) }));
-
-        let (status, body) = response_body(router, "/health/ready").await;
+        let (status, body) = super::readiness_response(false);
+        let body_json = serde_json::to_string(&body.0).unwrap();
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(body.contains("\"database_configured\":false"));
+        assert!(body_json.contains("\"database_configured\":true"));
+        assert!(body_json.contains("\"database\":\"unavailable\""));
     }
 }

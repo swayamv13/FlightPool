@@ -1,5 +1,8 @@
 use std::error::Error;
+use std::io;
+use std::time::Duration;
 
+use sqlx::postgres::PgPoolOptions;
 use tracing_subscriber::{EnvFilter, fmt};
 
 #[tokio::main]
@@ -18,7 +21,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         })?;
 
     let config = backend::Config::from_env()?;
-    let app = backend::create_router();
+    let pool = PgPoolOptions::new()
+        .max_connections(10)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect(&config.database_url)
+        .await
+        .map_err(|_| io::Error::other("failed to connect to PostgreSQL"))?;
+    let app = backend::create_router(pool);
     let address = format!("0.0.0.0:{}", config.port);
     let listener = tokio::net::TcpListener::bind(&address).await?;
 
